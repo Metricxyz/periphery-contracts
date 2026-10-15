@@ -1,0 +1,60 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    name: Forge Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      # Use default GITHUB_TOKEN for this repo. A PAT used as checkout token would also be used
+      # to fetch metric-periphery; a fine-grained PAT scoped only to pool-contracts then returns 403.
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Configure git for private Metricxyz submodules
+        env:
+          SUBMODULE_PAT: ${{ secrets.PRIVATE_SUBMODULES_PAT }}
+        run: |
+          if [ -z "${SUBMODULE_PAT}" ]; then
+            echo "Set repository secret PRIVATE_SUBMODULES_PAT with read access to Metricxyz/pool-contracts." >&2
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${SUBMODULE_PAT}@github.com/Metricxyz/".insteadOf "https://github.com/Metricxyz/"
+
+      - name: Fetch submodules
+        run: git submodule sync --recursive && git submodule update --init --force --depth 1 --recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Check Prettier (non-Solidity)
+        run: npm run format:prettier:check
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # Pin so `forge fmt --check` matches local installs (fmt output varies by release).
+          version: 1.7.0
+
+      - name: Check Solidity formatting
+        run: forge fmt --check
+
+      - name: Build
+        run: forge build
+
+      - name: Run tests
+        run: forge test -vvv

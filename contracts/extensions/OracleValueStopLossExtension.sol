@@ -1,0 +1,367 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.35;
+
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {IMetricOmmExtensions} from "@metric-core/interfaces/extensions/IMetricOmmExtensions.sol";
+import {IMetricOmmPool} from "@metric-core/interfaces/IMetricOmmPool/IMetricOmmPool.sol";
+import {PoolStateLibrary} from "@metric-core/libraries/PoolStateLibrary.sol";
+import {Slot0Library} from "@metric-core/libraries/Slot0Library.sol";
+import {PoolSlot0} from "@metric-core/types/Slot0.sol";
+import {IOracleValueStopLossExtension} from "../interfaces/extensions/IOracleValueStopLossExtension.sol";
+import {BaseMetricExtension} from "./base/BaseMetricExtension.sol";
+
+/// @title OracleValueStopLossExtension
+/// @notice Tracks per-bin value per share in token0 and token1 terms at bid/ask oracle marks,
+///         against decaying high watermarks. Drawdown, decay, timelock and watermark changes are timelocked so LPs
+///         can react; monitor at least as often as the timelock or trust the pool admin.
+/// @dev Lifecycle (intentional):
+///      - Watermarks are not seeded on liquidity adds. They initialize on the first swap that
+///        touches a live bin (`hwm == 0` ratchets to the live metric). That first trade is
+///        therefore not drawdown-protected.
+///      - Watermarks are not cleared on removeLiquidity. Empty bins only reset to zero when a
+///        later swap iterates them (`totalShares == 0`). Until that crossing, a remint into a
+///        previously emptied bin keeps the old HWM (can freeze swaps). After an empty crossing
+///        resets HWM to zero, the next trade on a reminted bin is again unprotected like a
+///        first-touch seed.
+///
+///      Value formulas (Q64.64 price = token1 per token0), per-share in bin scaled units:
+///
+///      metricToken0 = t0*SCALE/shares + (t1 * 2^64 / bid) * SCALE / shares
+///      metricToken1 = (t0 * ask / 2^64) * SCALE / shares + t1*SCALE/shares
+///
+///      Bid/ask marks are more restrictive than mid: divide by bid, multiply by ask → higher watermarks.
+///      A pure price move pushes the metrics in opposite directions; a value leak pushes both down.
+///        - metricToken0 breach (bid suspect-high) blocks zeroForOne == true  (token1 outflow)
+///        - metricToken1 breach (ask suspect-low)  blocks zeroForOne == false (token0 outflow)
+///        - both breached blocks both directions
+///
+///      Watermarks decay lazily per bin at decayPerSecondE18: linearly between checks, compounding across checks; a
+///      rate change applies to the time since each bin's last check. Only bins crossed by a swap are
+///      checked, a breach blocks only the affected direction, and `drawdownE6 == 0` disables the check.
+contract OracleValueStopLossExtension is BaseMetricExtension, IOracleValueStopLossExtension {
+  uint256 private constant Q64 = 1 << 64;
+  uint256 private constant E6 = 1e6;
+  uint256 private constant E18 = 1e18;
+  /// @dev Fixed-point scale for per-share metrics; keeps precision within uint104 headroom.
+  uint256 private constant METRIC_SCALE = 1e18;
+  uint256 private constant METRIC_MAX = type(uint104).max;
+
+  mapping(address pool => PoolStopLossConfig) public oracleStopLossConfig;
+  mapping(address pool => PoolStopLossSchedule) public poolStopLossSchedule;
+  mapping(address pool => PendingHighWatermarks) public pendingHighWatermark;
+  mapping(address pool => mapping(int16 binIdx => BinHighWatermarks)) public highWatermarks;
+
+  constructor(address factory_) BaseMetricExtension(factory_) {}
+
+  /// @notice Called once by the factory at pool creation.
+  ///         `data` = `abi.encode(uint32 drawdownE6, uint64 decayPerSecondE18, uint40 timelockSeconds)`.
+  /// @dev Applies immediately (no timelock); `timelockSeconds` is not validated and may be 0.
+  function initialize(address pool, bytes calldata data)
+    external
+    override(BaseMetricExtension, IOracleValueStopLossExtension)
+    onlyFactory
+    returns (bytes4)
+  {
+    if (oracleStopLossConfig[pool].initialized) {
+      revert OracleStopLossAlreadyInitialized(pool);
+    }
+
+    (uint32 drawdownE6, uint64 decayPerSecondE18, uint40 timelock) = abi.decode(data, (uint32, uint64, uint40));
+    _validateDrawdown(drawdownE6);
+    _validateDecay(decayPerSecondE18);
+
+    oracleStopLossConfig[pool] = PoolStopLossConfig({
+      drawdownE6: drawdownE6, decayPerSecondE18: decayPerSecondE18, timelock: timelock, initialized: true
+    });
+
+    emit OracleStopLossDrawdownSet(pool, drawdownE6);
+    emit OracleStopLossDecaySet(pool, decayPerSecondE18);
+    emit OracleStopLossTimelockSet(pool, timelock);
+    return IMetricOmmExtensions.initialize.selector;
+  }
+
+  /// @notice Current (decayed) watermarks — what the next check compares against.
+  function currentHighWatermarks(address pool, int16 binIdx) external view returns (uint256 hwm0, uint256 hwm1) {
+    BinHighWatermarks memory hwm = highWatermarks[pool][binIdx];
+    uint256 rate = oracleStopLossConfig[pool].decayPerSecondE18;
+    uint256 dt = block.timestamp - hwm.lastDecayTs;
+    return (_decayed(hwm.token0, rate, dt), _decayed(hwm.token1, rate, dt));
+  }
+
+  function proposeOracleStopLossTimelock(address pool_, uint40 newTimelock) external onlyPoolAdmin(pool_) {
+    PoolStopLossSchedule storage sched = _initializedSchedule(pool_);
+    uint40 executeAfter = _afterTimelock(pool_);
+    sched.pendingTimelock = newTimelock;
+    sched.pendingTimelockExecuteAfter = executeAfter;
+    emit OracleStopLossTimelockProposed(pool_, newTimelock, executeAfter);
+  }
+
+  function executeOracleStopLossTimelock(address pool_) external onlyPoolAdmin(pool_) {
+    PoolStopLossSchedule storage sched = _initializedSchedule(pool_);
+    if (sched.pendingTimelockExecuteAfter == 0) revert OracleStopLossNoPendingTimelock(pool_);
+    _requireElapsed(sched.pendingTimelockExecuteAfter);
+    uint40 timelock = sched.pendingTimelock;
+    oracleStopLossConfig[pool_].timelock = timelock;
+    (sched.pendingTimelock, sched.pendingTimelockExecuteAfter) = (0, 0);
+    emit OracleStopLossTimelockSet(pool_, timelock);
+  }
+
+  function cancelOracleStopLossTimelock(address pool_) external onlyPoolAdmin(pool_) {
+    PoolStopLossSchedule storage sched = _initializedSchedule(pool_);
+    if (sched.pendingTimelockExecuteAfter == 0) revert OracleStopLossNoPendingTimelock(pool_);
+    (sched.pendingTimelock, sched.pendingTimelockExecuteAfter) = (0, 0);
+    emit OracleStopLossTimelockCancelled(pool_);
+  }
+
+  function proposeOracleStopLossDrawdown(address pool_, uint256 newMaxDrawdownE6) external onlyPoolAdmin(pool_) {
+    _validateDrawdown(newMaxDrawdownE6);
+    PoolStopLossSchedule storage sched = _initializedSchedule(pool_);
+    uint40 executeAfter = _afterTimelock(pool_);
+    sched.pendingDrawdownE6 = uint32(newMaxDrawdownE6);
+    sched.pendingDrawdownExecuteAfter = executeAfter;
+    emit OracleStopLossDrawdownProposed(pool_, newMaxDrawdownE6, executeAfter);
+  }
+
+  function executeOracleStopLossDrawdown(address pool_) external onlyPoolAdmin(pool_) {
+    PoolStopLossSchedule storage sched = _initializedSchedule(pool_);
+    if (sched.pendingDrawdownExecuteAfter == 0) revert OracleStopLossNoPendingDrawdown(pool_);
+    _requireElapsed(sched.pendingDrawdownExecuteAfter);
+    uint32 drawdown = sched.pendingDrawdownE6;
+    oracleStopLossConfig[pool_].drawdownE6 = drawdown;
+    (sched.pendingDrawdownE6, sched.pendingDrawdownExecuteAfter) = (0, 0);
+    emit OracleStopLossDrawdownSet(pool_, drawdown);
+  }
+
+  function cancelOracleStopLossDrawdown(address pool_) external onlyPoolAdmin(pool_) {
+    PoolStopLossSchedule storage sched = _initializedSchedule(pool_);
+    if (sched.pendingDrawdownExecuteAfter == 0) revert OracleStopLossNoPendingDrawdown(pool_);
+    (sched.pendingDrawdownE6, sched.pendingDrawdownExecuteAfter) = (0, 0);
+    emit OracleStopLossDrawdownCancelled(pool_);
+  }
+
+  /// @notice Watermark decay per second (linear between checks), E18 scale (~5.8e11 ~= 5%/day). 0 disables decay.
+  function proposeOracleStopLossDecay(address pool_, uint256 newDecayPerSecondE18) external onlyPoolAdmin(pool_) {
+    _validateDecay(newDecayPerSecondE18);
+    PoolStopLossSchedule storage sched = _initializedSchedule(pool_);
+    uint40 executeAfter = _afterTimelock(pool_);
+    // forge-lint: disable-next-line(unsafe-typecast)
+    sched.pendingDecayPerSecondE18 = uint64(newDecayPerSecondE18);
+    sched.pendingDecayExecuteAfter = executeAfter;
+    emit OracleStopLossDecayProposed(pool_, newDecayPerSecondE18, executeAfter);
+  }
+
+  function executeOracleStopLossDecay(address pool_) external onlyPoolAdmin(pool_) {
+    PoolStopLossSchedule storage sched = _initializedSchedule(pool_);
+    if (sched.pendingDecayExecuteAfter == 0) revert OracleStopLossNoPendingDecay(pool_);
+    _requireElapsed(sched.pendingDecayExecuteAfter);
+    uint64 decay = sched.pendingDecayPerSecondE18;
+    oracleStopLossConfig[pool_].decayPerSecondE18 = decay;
+    (sched.pendingDecayPerSecondE18, sched.pendingDecayExecuteAfter) = (0, 0);
+    emit OracleStopLossDecaySet(pool_, decay);
+  }
+
+  function cancelOracleStopLossDecay(address pool_) external onlyPoolAdmin(pool_) {
+    PoolStopLossSchedule storage sched = _initializedSchedule(pool_);
+    if (sched.pendingDecayExecuteAfter == 0) revert OracleStopLossNoPendingDecay(pool_);
+    (sched.pendingDecayPerSecondE18, sched.pendingDecayExecuteAfter) = (0, 0);
+    emit OracleStopLossDecayCancelled(pool_);
+  }
+
+  /// @notice Propose per-bin high watermarks; applied after the pool timelock via execute.
+  /// @dev One pending proposal per pool: a new proposal replaces a pending one, even for another bin.
+  function proposeOracleStopLossHighWatermarks(address pool_, int16 binIdx, uint104 newHwmToken0, uint104 newHwmToken1)
+    external
+    onlyPoolAdmin(pool_)
+  {
+    _requireInitialized(pool_);
+    uint40 executeAfter = _afterTimelock(pool_);
+    pendingHighWatermark[pool_] =
+      PendingHighWatermarks({token0: newHwmToken0, token1: newHwmToken1, binIdx: binIdx, executeAfter: executeAfter});
+    emit OracleStopLossHighWatermarkProposed(pool_, binIdx, newHwmToken0, newHwmToken1, executeAfter);
+  }
+
+  /// @notice Apply the pending watermarks. Also resets the decay clock for the bin.
+  function executeOracleStopLossHighWatermarks(address pool_) external onlyPoolAdmin(pool_) {
+    PendingHighWatermarks memory pending = pendingHighWatermark[pool_];
+    if (pending.executeAfter == 0) revert OracleStopLossNoPendingHighWatermark(pool_);
+    _requireElapsed(pending.executeAfter);
+    highWatermarks[pool_][pending.binIdx] =
+    // forge-lint: disable-next-line(unsafe-typecast)
+    BinHighWatermarks({token0: pending.token0, token1: pending.token1, lastDecayTs: uint40(block.timestamp)});
+    delete pendingHighWatermark[pool_];
+    emit OracleStopLossHighWatermarkUpdated(pool_, pending.binIdx, pending.token0, pending.token1);
+  }
+
+  function cancelOracleStopLossHighWatermarks(address pool_) external onlyPoolAdmin(pool_) {
+    if (pendingHighWatermark[pool_].executeAfter == 0) revert OracleStopLossNoPendingHighWatermark(pool_);
+    delete pendingHighWatermark[pool_];
+    emit OracleStopLossHighWatermarkCancelled(pool_);
+  }
+
+  function afterSwap(
+    address,
+    address,
+    bool zeroForOne,
+    int128,
+    uint128,
+    uint256 packedSlot0Initial,
+    uint256 packedSlot0Final,
+    uint128 bidPriceX64,
+    uint128 askPriceX64,
+    uint128,
+    int128,
+    int128,
+    uint256,
+    bytes calldata
+  ) external override returns (bytes4) {
+    // Only the factory can initialize, so an initialized msg.sender is a legit pool — no onlyPool needed.
+    _requireInitialized(msg.sender);
+    _afterSwapOracleStopLoss(msg.sender, packedSlot0Initial, packedSlot0Final, bidPriceX64, askPriceX64, zeroForOne);
+    return IMetricOmmExtensions.afterSwap.selector;
+  }
+
+  /// @dev `zeroForOne` forwarded from the swap params (true = token0 in, token1 out of the pool).
+  function _afterSwapOracleStopLoss(
+    address pool_,
+    uint256 packedSlot0Initial,
+    uint256 packedSlot0Final,
+    uint128 bidPriceX64,
+    uint128 askPriceX64,
+    bool zeroForOne
+  ) internal {
+    PoolStopLossConfig memory cfg = oracleStopLossConfig[pool_];
+    uint256 drawdown = cfg.drawdownE6;
+    if (drawdown == 0) return;
+    uint256 minShares = IMetricOmmPool(pool_).getImmutables().minimalOperationalLiquidity;
+    if (minShares == 0) minShares = 1;
+    PoolSlot0 memory s0 = Slot0Library.unpack(packedSlot0Initial);
+    PoolSlot0 memory s1 = Slot0Library.unpack(packedSlot0Final);
+    int16 lo = s0.curBinIdx < s1.curBinIdx ? s0.curBinIdx : s1.curBinIdx;
+    int16 hi = s0.curBinIdx > s1.curBinIdx ? s0.curBinIdx : s1.curBinIdx;
+    // forge-lint: disable-next-line(unsafe-typecast)
+    uint256 count = uint256(int256(hi) - int256(lo) + 1);
+    int16[] memory binIdxs = new int16[](count);
+    for (uint256 i = 0; i < count; i++) {
+      // forge-lint: disable-next-line(unsafe-typecast)
+      binIdxs[i] = int16(int256(lo) + int256(i));
+    }
+    bytes32[] memory states = PoolStateLibrary._multipleBinStates(pool_, binIdxs);
+    bytes32[] memory shares = PoolStateLibrary._multipleBinTotalShares(pool_, binIdxs);
+    uint256 floorMultiplier = E6 - drawdown;
+    uint256 decayRate = cfg.decayPerSecondE18;
+    for (uint256 i = 0; i < count; i++) {
+      uint256 totalShares = PoolStateLibrary._decodeBinTotalShares(shares[i]);
+      if (totalShares == 0) {
+        // Reset only on empty-bin crossing in afterSwap (not on removeLiquidity).
+        delete highWatermarks[pool_][binIdxs[i]];
+        continue;
+      }
+      (uint104 t0, uint104 t1,,,) = PoolStateLibrary._decodeBinState(states[i]);
+      (uint256 metricT0, uint256 metricT1) = _metrics(t0, t1, totalShares, minShares, bidPriceX64, askPriceX64);
+      _checkAndUpdateWatermarks(pool_, binIdxs[i], metricT0, metricT1, floorMultiplier, decayRate, zeroForOne);
+    }
+  }
+
+  /// @dev Per-share metrics in bin scaled units; shares floored at minimalOperationalLiquidity.
+  ///      Token0 metric divides by bid, token1 metric multiplies by ask — higher watermarks than mid.
+  function _metrics(
+    uint104 t0,
+    uint104 t1,
+    uint256 totalShares,
+    uint256 minShares,
+    uint128 bidPriceX64,
+    uint128 askPriceX64
+  ) private pure returns (uint256 valueInToken0PerShare, uint256 valueInToken1PerShare) {
+    uint256 shares = totalShares < minShares ? minShares : totalShares;
+    uint256 t0ps = Math.mulDiv(uint256(t0), METRIC_SCALE, shares);
+    uint256 t1ps = Math.mulDiv(uint256(t1), METRIC_SCALE, shares);
+    valueInToken0PerShare = _clampMetric(t0ps + Math.mulDiv(t1ps, Q64, bidPriceX64));
+    valueInToken1PerShare = _clampMetric(Math.mulDiv(uint256(t0ps), askPriceX64, Q64) + t1ps);
+  }
+
+  function _checkAndUpdateWatermarks(
+    address pool_,
+    int16 binIdx,
+    uint256 metricT0,
+    uint256 metricT1,
+    uint256 floorMultiplier,
+    uint256 decayRate,
+    bool zeroForOne
+  ) private {
+    BinHighWatermarks storage hwmS = highWatermarks[pool_][binIdx];
+    uint256 dt = block.timestamp - hwmS.lastDecayTs;
+
+    (uint256 hwm0, bool breach0) = _applyWatermark(metricT0, _decayed(hwmS.token0, decayRate, dt), floorMultiplier);
+    if (breach0 && zeroForOne) {
+      revert OracleStopLossTriggered(binIdx, true, metricT0, (hwm0 * floorMultiplier) / E6);
+    }
+
+    (uint256 hwm1, bool breach1) = _applyWatermark(metricT1, _decayed(hwmS.token1, decayRate, dt), floorMultiplier);
+    if (breach1 && !zeroForOne) {
+      revert OracleStopLossTriggered(binIdx, false, metricT1, (hwm1 * floorMultiplier) / E6);
+    }
+
+    // forge-lint: disable-next-line(unsafe-typecast)
+    hwmS.token0 = uint104(hwm0);
+    // forge-lint: disable-next-line(unsafe-typecast)
+    hwmS.token1 = uint104(hwm1);
+    // forge-lint: disable-next-line(unsafe-typecast)
+    hwmS.lastDecayTs = uint40(block.timestamp);
+  }
+
+  function _requireInitialized(address pool_) private view {
+    if (!oracleStopLossConfig[pool_].initialized) revert OracleStopLossNotInitialized(pool_);
+  }
+
+  /// @dev Returns the schedule slot; reverts if the pool was never initialized by the factory.
+  function _initializedSchedule(address pool_) private view returns (PoolStopLossSchedule storage sched) {
+    _requireInitialized(pool_);
+    return poolStopLossSchedule[pool_];
+  }
+
+  function _afterTimelock(address pool_) private view returns (uint40) {
+    // Compute in uint256 so a huge timelock cannot truncate into a past `executeAfter`.
+    uint256 executeAfter = block.timestamp + uint256(oracleStopLossConfig[pool_].timelock);
+    if (executeAfter > type(uint40).max) revert OracleStopLossTimelockOverflow(executeAfter);
+    // forge-lint: disable-next-line(unsafe-typecast)
+    return uint40(executeAfter);
+  }
+
+  function _requireElapsed(uint40 executeAfter) private view {
+    if (block.timestamp < executeAfter) revert OracleStopLossTimelockNotElapsed(executeAfter, block.timestamp);
+  }
+
+  function _validateDrawdown(uint256 drawdownE6) private pure {
+    if (drawdownE6 > E6) revert OracleStopLossDrawdownTooLarge(drawdownE6);
+  }
+
+  function _validateDecay(uint256 decayPerSecondE18) private pure {
+    if (decayPerSecondE18 > E18) revert OracleStopLossDecayTooLarge(decayPerSecondE18);
+  }
+
+  /// @dev Clamp to uint104 storage width. The metric stays below this only while the per-1e18-share value (~`P̂_i`,
+  ///      set at pool creation) fits in uint104; beyond that it saturates.
+  function _clampMetric(uint256 metric) private pure returns (uint256) {
+    return metric > METRIC_MAX ? METRIC_MAX : metric;
+  }
+
+  /// @dev Linear decay; floors at 0 (ratchet restores from the live metric on next touch).
+  function _decayed(uint256 hwm, uint256 ratePerSecondE18, uint256 dt) private pure returns (uint256) {
+    if (ratePerSecondE18 == 0 || dt == 0 || hwm == 0) return hwm;
+    uint256 factor = ratePerSecondE18 * dt;
+    if (factor >= E18) return 0;
+    return hwm - (hwm * factor) / E18;
+  }
+
+  /// @dev Ratchet up on new highs; report breach below the drawdown floor. Direction-aware
+  ///      blocking is decided by the caller.
+  function _applyWatermark(uint256 metric, uint256 hwm, uint256 floorMultiplier)
+    private
+    pure
+    returns (uint256 newHwm, bool breached)
+  {
+    if (metric >= hwm) return (metric, false);
+    breached = metric < (hwm * floorMultiplier) / E6;
+    return (hwm, breached);
+  }
+}

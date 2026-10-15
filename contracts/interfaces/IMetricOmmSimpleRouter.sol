@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.35;
+
+import {IMetricOmmSwapCallback} from "@metric-core/interfaces/callbacks/IMetricOmmSwapCallback.sol";
+import {IMulticall} from "./IMulticall.sol";
+import {ISelfPermit} from "./ISelfPermit.sol";
+import {IPeripheryPayments} from "./IPeripheryPayments.sol";
+import {ISequence} from "./ISequence.sol";
+import {IExternalSwap} from "./IExternalSwap.sol";
+
+/// @title IMetricOmmSimpleRouter
+/// @notice ERC-20 exact-input and exact-output swaps through one or more MetricOmm pools.
+/// @dev Scope: supports native ETH (auto-wrapped to WETH in payment) and pre-wrapped WETH/ERC-20 as swap
+///      input/output. `unwrapWETH9`, `sweepToken`, and `refundETH` are available via IPeripheryPayments.
+///      Unspent ETH stays in the router until anyone calls `refundETH`; batch it in the same `multicall`.
+///      On-chain quotes are not part of this interface.
+///      Only pools registered on the configured factory may be used. Path token connectivity and single-hop
+///      tokenIn / tokenOut against pool immutables remain the caller's obligation off-chain.
+///      `pools[i]` is intended to connect `tokens[i]` and `tokens[i+1]`; `extensionDatas[i]` is passed to `pools[i]`.
+///      Multihop exact-output executes `pools` from last to first; `amountOut` is `tokens[tokens.length - 1]`.
+///      Multihop paths omit per-hop price limits; slippage is controlled solely by `amountOutMinimum` (exact input)
+///      or `amountInMaximum` (exact output).
+interface IMetricOmmSimpleRouter is
+  IMetricOmmSwapCallback,
+  ISelfPermit,
+  IMulticall,
+  ISequence,
+  IExternalSwap,
+  IPeripheryPayments
+{
+  // ============ Errors ============
+
+  /// @notice Swap deadline is in the past.
+  /// @param deadline User-provided deadline.
+  /// @param timestamp Current block timestamp.
+  error TransactionExpired(uint256 deadline, uint256 timestamp);
+  /// @notice Swap callback caller is not the active pool in transient context.
+  error InvalidCallbackCaller();
+  /// @notice Constructor received zero factory address.
+  error InvalidFactory();
+  /// @notice Pool is not registered on the configured factory.
+  /// @param pool Address that failed factory provenance validation.
+  error InvalidPool(address pool);
+  /// @notice Returned or callback swap deltas do not match expected sign/shape (one positive, one negative).
+  error InvalidSwapDeltas();
+  /// @notice Route arrays are inconsistent (`tokens.length < 2`, `pools.length != tokens.length - 1`,
+  ///         `extensionDatas.length != pools.length`) or longer than 256 pools.
+  /// @dev Does not validate that each pool connects the adjacent path tokens; that is the caller's obligation.
+  error InvalidPath();
+  /// @notice Exact-input output amount is below user minimum.
+  /// @param amountOut Actual output amount.
+  /// @param minAmountOut Minimum required output.
+  error InsufficientOutput(uint256 amountOut, uint256 minAmountOut);
+  /// @notice Exact-output input amount exceeded user maximum.
+  /// @param amountIn Actual input used.
+  /// @param maxAmountIn Maximum allowed input.
+  error InputTooHigh(uint256 amountIn, uint256 maxAmountIn);
+  /// @notice Final hop output does not match the requested exact output amount.
+  /// @param amountOut Actual output from the swap.
+  /// @param expectedAmountOut Requested exact output amount.
+  error InvalidOutputAmount(int128 amountOut, uint128 expectedAmountOut);
+  /// @notice Intermediate hop output does not match the input owed to the pool that called back for it.
+  /// @param hop Index of the pool whose output did not match.
+  /// @param amountOut Actual output from the hop.
+  /// @param amount Expected output of this hop (the input owed to the calling pool).
+  error InvalidOutputAmountAtHop(uint8 hop, int128 amountOut, int256 amount);
+  /// @notice Multihop exact-input hop consumed less input than requested (partial fill).
+  /// @param hop Hop index where the partial fill occurred.
+  /// @param amountIn Actual input consumed by the hop.
+  /// @param expected Input amount specified for the hop.
+  error InvalidInputAmountAtHop(uint8 hop, int128 amountIn, int256 expected);
+  /// @notice Swap amount exceeds the maximum representable as a signed pool delta.
+  /// @param amount Amount that does not fit in int128.
+  error AmountTooLarge(uint128 amount);
+
+  // ============ Types ============
+
+  /// @notice Single-hop exact-input swap parameters.
+  /// @param pool MetricOmm pool address for this hop.
+  /// @param tokenIn ERC-20 paid to the pool in the swap callback, pulled from `msg.sender` (for WETH the router's ETH balance is wrapped first); caller must set correctly off-chain.
+  /// @param tokenOut Output token for this hop; informational for integrators, unused on-chain.
+  /// @param zeroForOne `true` sells token0 for token1.
+  /// @param amountIn Input amount; partial fills are accepted, only `amountOutMinimum` is enforced.
+  /// @param amountOutMinimum Minimum output amount required.
+  /// @param recipient Address that receives the output token.
+  /// @param deadline Timestamp after which the swap reverts.
+  /// @param priceLimitX64 Q64.64 execution bound. `zeroForOne`: `0` is unconstrained lower bound.
+  ///        `!zeroForOne`: `type(uint128).max` is unconstrained upper bound. The opposite sentinel is also treated as unconstrained.
+  /// @param extensionData Opaque bytes forwarded to the pool swap extension.
+  struct ExactInputSingleParams {
+    address pool;
+    address tokenIn;
+    address tokenOut;
+    bool zeroForOne;
+    uint128 amountIn;
+    uint128 amountOutMinimum;
+    address recipient;
+    uint256 deadline;
+    uint128 priceLimitX64;
+    bytes extensionData;
+  }
+
+  /// @notice Multihop exact-input swap parameters.
+  /// @dev Slippage protection is `amountOutMinimum` only; each hop uses an open price limit.
+  ///      The caller must ensure `tokens` and `pools` describe a valid connected route.
+  /// @param tokens Path tokens `[t0, t1, …, tn]`.
+  /// @param pools Pool between each adjacent token pair; length must be `tokens.length - 1`.
+  /// @param extensionDatas Extension payload per pool; length must match `pools`.
+  /// @param zeroForOneBitMap Bit `i` is the swap direction for `pools[i]`; supports up to 256 hops.
+  /// @param amountIn Exact input amount of `tokens[0]`.
+  /// @param amountOutMinimum Minimum output amount of `tokens[tokens.length - 1]`.
+  /// @param recipient Address that receives the final output token.
+  /// @param deadline Timestamp after which the swap reverts.
+  struct ExactInputParams {
+    address[] tokens;
+    address[] pools;
+    bytes[] extensionDatas;
+    uint256 zeroForOneBitMap;
+    uint128 amountIn;
+    uint128 amountOutMinimum;
+    address recipient;
+    uint256 deadline;
+  }
+
+  /// @notice Single-hop exact-output swap parameters.
+  /// @param pool MetricOmm pool address for this hop.
+  /// @param tokenIn ERC-20 paid to the pool in the swap callback, pulled from `msg.sender` (for WETH the router's ETH balance is wrapped first); caller must set correctly off-chain.
+  /// @param tokenOut Output token for this hop; informational for integrators, unused on-chain.
+  /// @param zeroForOne `true` sells token0 for token1.
+  /// @param amountOut Exact output amount.
+  /// @param amountInMaximum Maximum input amount allowed.
+  /// @param recipient Address that receives the output token.
+  /// @param deadline Timestamp after which the swap reverts.
+  /// @param priceLimitX64 Q64.64 execution bound. `zeroForOne`: `0` is unconstrained lower bound.
+  ///        `!zeroForOne`: `type(uint128).max` is unconstrained upper bound. The opposite sentinel is also treated as unconstrained.
+  /// @param extensionData Opaque bytes forwarded to the pool swap extension.
+  struct ExactOutputSingleParams {
+    address pool;
+    address tokenIn;
+    address tokenOut;
+    bool zeroForOne;
+    uint128 amountOut;
+    uint128 amountInMaximum;
+    address recipient;
+    uint256 deadline;
+    uint128 priceLimitX64;
+    bytes extensionData;
+  }
+
+  /// @notice Multihop exact-output swap parameters.
+  /// @dev Slippage protection is `amountInMaximum` only; each hop uses an open price limit.
+  ///      The caller must ensure `tokens` and `pools` describe a valid connected route.
+  ///      Execution starts at `pools[pools.length - 1]` and walks toward `pools[0]`.
+  /// @param tokens Path tokens `[t0, t1, …, tn]`.
+  /// @param pools Pool between each adjacent token pair; length must be `tokens.length - 1`.
+  /// @param extensionDatas Extension payload per pool; length must match `pools`.
+  /// @param zeroForOneBitMap Bit `i` is the swap direction for `pools[i]`; supports up to 256 hops.
+  /// @param amountOut Exact output amount of `tokens[tokens.length - 1]`.
+  /// @param amountInMaximum Maximum input amount of `tokens[0]`.
+  /// @param recipient Address that receives the final output token.
+  /// @param deadline Timestamp after which the swap reverts.
+  struct ExactOutputParams {
+    address[] tokens;
+    address[] pools;
+    bytes[] extensionDatas;
+    uint256 zeroForOneBitMap;
+    uint128 amountOut;
+    uint128 amountInMaximum;
+    address recipient;
+    uint256 deadline;
+  }
+
+  // ============ Mutating: exact input ============
+
+  /// @notice Swap an exact input amount through a single pool.
+  /// @dev Reverts with `TransactionExpired` after `deadline` and `InsufficientOutput` if the output is below `amountOutMinimum`.
+  /// @param params See `ExactInputSingleParams`.
+  /// @return amountOut Output amount sent to `params.recipient`.
+  function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+
+  /// @notice Swap an exact input amount through a multihop route.
+  /// @dev Reverts with `TransactionExpired` after `deadline`, `InvalidPath` for malformed route arrays,
+  ///      `InvalidInputAmountAtHop` if a hop fills partially, and `InsufficientOutput` if the final output is below
+  ///      `amountOutMinimum`.
+  /// @param params See `ExactInputParams`.
+  /// @return amountOut Output amount of the last token sent to `params.recipient`.
+  function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
+
+  // ============ Mutating: exact output ============
+
+  /// @notice Swap for an exact output amount through a single pool.
+  /// @dev Reverts with `TransactionExpired` after `deadline`, `InvalidOutputAmount` if the pool does not deliver
+  ///      exactly `amountOut`, and `InputTooHigh` if the input exceeds `amountInMaximum`.
+  /// @param params See `ExactOutputSingleParams`.
+  /// @return amountIn Input amount paid to the pool (from the caller, or from the router's ETH balance for WETH).
+  function exactOutputSingle(ExactOutputSingleParams calldata params) external payable returns (uint256 amountIn);
+
+  /// @notice Swap for an exact output amount through a multihop route.
+  /// @dev Reverts with `TransactionExpired` after `deadline`, `InvalidPath` for malformed route arrays,
+  ///      `InvalidOutputAmount` / `InvalidOutputAmountAtHop` if a hop does not deliver the exact amount, and
+  ///      `InputTooHigh` if the first-hop input exceeds `amountInMaximum`.
+  /// @param params See `ExactOutputParams`.
+  /// @return amountIn Input amount of `tokens[0]` paid to `pools[0]` (from the caller, or from the router's ETH balance for WETH).
+  function exactOutput(ExactOutputParams calldata params) external payable returns (uint256 amountIn);
+}

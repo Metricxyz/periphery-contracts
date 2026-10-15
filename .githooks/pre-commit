@@ -1,0 +1,33 @@
+#!/bin/sh
+# Format checks only — fast fail before commit is created.
+# Tests run in pre-push (see .githooks/pre-push).
+# Enable: npm install  (sets git config --local core.hooksPath .githooks)
+# Verify: git config --local --get core.hooksPath  (must print .githooks)
+
+set -eu
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT" || exit 1
+
+if ! command -v forge >/dev/null 2>&1; then
+  echo "pre-commit: forge not found on PATH; install Foundry." >&2
+  exit 1
+fi
+
+echo "pre-commit: forge fmt --check..."
+if ! forge fmt --check; then
+  echo "pre-commit: forge fmt --check failed. Run: forge fmt" >&2
+  exit 1
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  echo "pre-commit: npm not found; install Node.js." >&2
+  exit 1
+fi
+if [ ! -d node_modules/prettier ]; then
+  echo "pre-commit: run npm install (Prettier missing under node_modules)." >&2
+  exit 1
+fi
+
+echo "pre-commit: Prettier check (non-Solidity)..."
+npm run format:prettier:check
