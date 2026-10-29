@@ -1,0 +1,12 @@
+tree 0aac90a295cd64a10944a25c273214b52c5d7e1f
+parent 32c0cfddc0d04802d9eee1ed24bdd588902885a6
+author Nradko <konrad@metric.xyz> 1789406804 +0200
+committer Nradko <konrad@metric.xyz> 1789406804 +0200
+gpgsig -----BEGIN SSH SIGNATURE-----
+ U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgGaOda87SG+U3kQpjlbbxbTOGXD
+ HJeQmpcqDIy9L5ruEAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5
+ AAAAQNwGzcoEgBWEquGVs777VGbqr9Y8WBYnRBbxLRs0lVz4zZD201tx+92oNU4lmq5JZV
+ sWQ3Kzjo42z+tTu6nNWQU=
+ -----END SSH SIGNATURE-----
+
+pin lib/metric-core to the latest main commit: 4410fec
