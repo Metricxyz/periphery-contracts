@@ -1,0 +1,16 @@
+tree 20ba2770025bf62e40f50db42b7d4b605bbebd5b
+parent 9d9814a48f55e6b517e81cef4c09d85c4264ea07
+author Nradko <konrad.wierzbik@gmail.com> 1781567356 +0200
+committer konrad-metric <konrad@metric.xyz> 1781567693 +0200
+
+Rename pool hooks to extensions across metric-periphery for metric-core alignment.
+
+Important changes:
+   - hooks to extensions directories - moved contracts/hooks and interfaces/hooks to extensions paths
+   - product contract renames - DepositAllowlistHook, SwapAllowlistHook, PriceVelocityGuardHook, OracleValueStopLossHook and matching interfaces renamed to Extension suffix
+   - BaseMetricExtension consolidation - inlined FACTORY, onlyFactory, onlyPoolAdmin, and related errors from removed SubhookUtils; HookNotImplemented renamed to ExtensionNotImplemented
+   - periphery API rename - hookData and hookDatas to extensionData and extensionDatas in router, swapper, liquidity adder, and quoter interfaces and implementations
+   - test suite rename - hook tests moved to test/extensions with updated contract names, imports, and variables
+
+Small changes:
+    - README terminology updated to IMetricOmmExtensions and extensionOrders; MockHookPool to MockExtensionPool; quoter and NatSpec comment wording; extension tests assert BaseMetricExtension.OnlyPoolAdmin; forge fmt on swapper, quoter, liquidity adder, and OracleValueStopLossSubExtension test
