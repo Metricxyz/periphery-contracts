@@ -1,0 +1,6 @@
+tree 39860d7097a4272d731ef24491af7154c351ff96
+parent ac61cbe724729a6098891d923a314551e824318d
+author Nradko <konrad.wierzbik@gmail.com> 1783002545 +0200
+committer Nradko <konrad.wierzbik@gmail.com> 1783002545 +0200
+
+Relicense extension contracts from BUSL-1.1 to MIT
