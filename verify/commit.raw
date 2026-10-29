@@ -1,0 +1,31 @@
+tree 497c1f2e61064c2aab8e85226460534512827e77
+parent 378a748793eee3d0b25e8651c0043fc0add1c37c
+author konrad-metric <konrad@metric.xyz> 1790620012 +0200
+committer GitHub <noreply@github.com> 1790620012 +0200
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ wsFcBAABCAAQBQJqurFsCRC1aQ7uu5UhlAAAlUAQAESA6kkqJvqx4qU1m07x13a4
+ 9x7XFCoqtwaU4yRiSvLVbClJl9AJHMyu8gPrXPDW+D3Dh53iuNn22B+Lh1WPqLDG
+ 8ATx78UI6oFNFOYA+L+sh6JV/K2Sb41AKopLbhJBB0a0yWEs9RqOKEorsyV3IPxy
+ imRsfFM0UocCK8WOSaTAI54FnTy4lr5vPNU+BFXrleO8WzkZ5MNNAuvgcSLfhxrw
+ tCJh6NoErovWiVFp73SefV9zpyTV7Nlaw1neCzfe3hvYJKbtWKgGbqvz0pef+ktz
+ x9qKuC5yz4CXT6ug2RIG+E72xn9kmWBDAfl4GK6RIWH8KEAYCF8ng5PXGesavgu3
+ 3T48IMvclMi9U6NNJke1fFwAn+GRhscZgP8FDxd2+ZFcTjxjPu67qAyiuFIkAJkx
+ vvQJC4H8mEGCO1RJtj7nL/97rgiIUx+xODxuQbhMLtMlhpMARUwfvlHiyntGw3Rz
+ t6H/sR2hID/qGFEtXfoaBcVERXxpbIKiXGYsKu3+KN3xUSh5IXVgAcwIg2gW8e2a
+ uDPGZQbrZT9F94A5yfO7w4kDiDjYOtA8WEY9EKxQlGGSSpsIBcuE+i2wp98igGIL
+ R1okrtL5h3BUFV0LL5eGRTNuSLYvkvTaMyqzOB6caAaTQ0OPMmckEfp6WB4l4o6L
+ qlhlWyDnbfWXZsTs7f5P
+ =xbsE
+ -----END PGP SIGNATURE-----
+ 
+
+Address Sherlock update audit findings for externalSwap and sequence. (#62)
+
+- sequence now emits SequenceStepFailed for every step failure that does not revert it, making fallback usage and
+  primary-route failure reasons visible in logs.
+- An expired externalSwap deadline now reverts with the router-wide TransactionExpired error;
+  IExternalSwap.DeadlineExpired is removed.
+- Consistent naming for the unspent-input refund (unspent, refundAsNative) across interface and implementation.
+- IExternalSwap and ISequence documented to the same NatSpec convention as the other router interfaces, including
+  how to compose sequence steps from multicall for a native-input swap with fallbacks.
