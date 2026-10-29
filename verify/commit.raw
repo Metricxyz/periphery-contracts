@@ -1,0 +1,14 @@
+tree 8ec18d11ef4a33aa3c53aebff1fcb724cdeb3a85
+parent 81a64f29bdbc6c870d4bb3f3614d81cb08d73ef7
+author Nradko <konrad.wierzbik@gmail.com> 1780687344 +0200
+committer konrad-metric <konrad@metric.xyz> 1780687824 +0200
+
+Split local git hooks so commits run format checks only and pushes run tests.
+Important changes:
+   - pre-commit hook - format checks only (forge fmt and Prettier); forge test removed
+   - pre-push hook - re-runs forge fmt and Prettier, then runs full forge test suite
+   - enable-git-hooks.cjs - relative core.hooksPath, chmod hooks executable, fail prepare on setup error
+   - README - document pre-commit vs pre-push behavior and just hooks setup
+
+Small changes:
+    - just hooks recipe added; pre-commit runs forge before npm; hook error messages drop --no-verify hints; updated hook header comments
