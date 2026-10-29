@@ -1,0 +1,26 @@
+tree 067d8d86237c164e2c514b4832a646d4b79d4c59
+parent f92a958c75c01ebef62a9e749ab037f6b813cf21
+parent f10fd9db1a447414b164fa4d7331a088f61d3154
+author christos-metric <christos@metric.xyz> 1789764883 -0400
+committer GitHub <noreply@github.com> 1789764883 -0400
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ wsFcBAABCAAQBQJqraUTCRC1aQ7uu5UhlAAArq8QAJnkq/w9NNAKCh+hFHoxakPG
+ qicc8jWKYrI0YEyKBIlsWnnnO61GAr9MTjPl1XRhgEJPUTPT5k7hwbHtFlpmZs+1
+ lk8U3OBCsOjD2hTpTKwv3ZOiZ+3+lF7J3b+bAzf/DKjTkJMdH/ZKimbIg+mNkedF
+ o2oweR4u2VV0OpDt7ZArZzB6mpwqPRfH+aiqLndG/gTQ6Mjo/B459Wz41cVtOqRH
+ geswSagLd+WvIM7b+/mN83ImVNQolU4rTfk1+W3pCFTokBHX9H1EPmovePmRXo12
+ IAJQvicj0yLnwku96LOkh2qv112XYobyMFI5bF7f4atb50nNi2AkTX6F7wNjYjxo
+ u0wDjLe6yk87j/iquRIrWymzh0kOwnUbheVsvDG+esPqdEMSWhBV5wJRDPeY4uvZ
+ ATsowMg7AKq9HR5/gTsBT/wYmhqvo/PQStA36R7vEBmEUJCdBNXCDMSf/NaYbUFS
+ lmY3mu1HNeP3hzhbl/wj5duB3BDkwzPAqsBwGTBQvFYMJS8dKrTdNa4HLDQsyW2Y
+ ZRcLv8FZ4jwlm0eZkpC4/Py+deUuoJLIDrbL6f7QfyUWcK+ynQV3WD28r/PWldoI
+ /mD6DAPr9McqcbhV1+sd61AaaPE+leM8MvBhw/4mhlwNChpMpjcbDHdgV6zUQALq
+ w2Sz2HNh+dZKkuEd1Eae
+ =lHNY
+ -----END PGP SIGNATURE-----
+ 
+
+Merge pull request #61 from Metricxyz/sequence
+
+Add sequence and external swap execution to router
