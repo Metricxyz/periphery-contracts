@@ -1,0 +1,14 @@
+tree 74f863a869235443b1460d6e6e1797e83c3d4fd6
+parent 7783672eb9b5a301e8a5425111d8e1d6f4473057
+author Nradko <konrad.wierzbik@gmail.com> 1780573879 +0200
+committer konrad-metric <konrad@metric.xyz> 1780573944 +0200
+
+Bump metric-core to dev-hooks 6aa6c3b and align swap simulation in periphery.
+
+Important changes:
+   - metric-core submodule - pin to 6aa6c3b (reentrancy guard, inSwap, isPool, hook-aware simulateSwapAndRevert)
+   - MetricOmmPoolQuoter - pass recipient and hookData to simulateSwapAndRevert; add hook-aware quoteSwap overload
+   - data provider tests - update direct simulateSwapAndRevert calls for new pool API
+
+Small changes:
+    - foundry.lock rev sync; quoter @dev note on default recipient; _quoteSwap internal helper
