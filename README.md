@@ -55,7 +55,7 @@ All extensions inherit **BaseMetricExtension** (unimplemented hooks revert by de
 Add the package to a Foundry project:
 
 ```bash
-forge install Metricxyz/metric-periphery
+forge install Metricxyz/periphery-contracts
 ```
 
 ```text
@@ -95,8 +95,8 @@ Get quotes off-chain from `MetricOmmSwapQuoter` via `eth_call` before submitting
 ## Installation
 
 ```bash
-git clone --recursive https://github.com/Metricxyz/metric-periphery.git
-cd metric-periphery
+git clone --recursive https://github.com/Metricxyz/periphery-contracts.git
+cd periphery-contracts
 forge build
 ```
 
@@ -170,6 +170,40 @@ test/              # Foundry tests, helpers and mocks
 ## Security and audits
 
 Audit reports and instructions for reporting vulnerabilities are published at [docs.metric.xyz — Security and audits](https://docs.metric.xyz/reference/security-and-audits).
+
+### Audited code
+
+Every commit named in the audit reports is published here as a tag named `audit-<commit>`. A tag is a new commit without the private history, so its own hash differs from the audited one. Its `contracts/` folder, though, is identical to the audited commit's, and the tag's `VERIFY.md` proves that from the commit hash printed in the report, without access to the private repository.
+
+| Tag                                                                                    | Audits                                                                                               | `contracts/` hash                          | `lib/metric-core`                                                           | Proof                                                                                      |
+| -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| [`audit-0069084`](https://github.com/Metricxyz/periphery-contracts/tree/audit-0069084) | Zellic audit (Jun 2026), audited                                                                     | `4c9d8d975e89e4975abddfebddf21f6c53a1919e` | [`6aa6c3b`](https://github.com/Metricxyz/pool-contracts/tree/audit-6aa6c3b) | [VERIFY.md](https://github.com/Metricxyz/periphery-contracts/blob/audit-0069084/VERIFY.md) |
+| [`audit-90039f9`](https://github.com/Metricxyz/periphery-contracts/tree/audit-90039f9) | Sherlock collaborative audit (May–Jun 2026), audited                                                 | `607ff7f1c5ceb6342b4053854acdfb868787a65c` | [`6aa6c3b`](https://github.com/Metricxyz/pool-contracts/tree/audit-6aa6c3b) | [VERIFY.md](https://github.com/Metricxyz/periphery-contracts/blob/audit-90039f9/VERIFY.md) |
+| [`audit-d210a84`](https://github.com/Metricxyz/periphery-contracts/tree/audit-d210a84) | Sherlock collaborative audit, fixes. Sherlock bug bounty contest (Jul 2026), audited                 | `fa3c0ec0b2ad2f804ac71ee5f2f3a593a2ff10aa` | [`7b9ab56`](https://github.com/Metricxyz/pool-contracts/tree/audit-7b9ab56) | [VERIFY.md](https://github.com/Metricxyz/periphery-contracts/blob/audit-d210a84/VERIFY.md) |
+| [`audit-9b69f75`](https://github.com/Metricxyz/periphery-contracts/tree/audit-9b69f75) | Sherlock bug bounty contest, fixes. Zellic re-audit (Sep 2026), final                                | `85028bfd01808bbb50d8621c84803ce583791abd` | [`4410fec`](https://github.com/Metricxyz/pool-contracts/tree/audit-4410fec) | [VERIFY.md](https://github.com/Metricxyz/periphery-contracts/blob/audit-9b69f75/VERIFY.md) |
+| [`audit-cc8fef9`](https://github.com/Metricxyz/periphery-contracts/tree/audit-cc8fef9) | Zellic re-audit (Sep 2026), starting point: the re-audit reviewed the changes from here to `9b69f75` | `b756bf2b72b53390f13a0102c38d1a669a122178` | [`72c65de`](https://github.com/Metricxyz/pool-contracts/tree/audit-72c65de) | [VERIFY.md](https://github.com/Metricxyz/periphery-contracts/blob/audit-cc8fef9/VERIFY.md) |
+| [`audit-378a748`](https://github.com/Metricxyz/periphery-contracts/tree/audit-378a748) | Sherlock periphery update review (Sep 2026), audited                                                 | `97b1ec583933735d23a3e250e25978591b57e8cf` | [`d4d0e2a`](https://github.com/Metricxyz/pool-contracts/tree/audit-d4d0e2a) | [VERIFY.md](https://github.com/Metricxyz/periphery-contracts/blob/audit-378a748/VERIFY.md) |
+| [`audit-ed58520`](https://github.com/Metricxyz/periphery-contracts/tree/audit-ed58520) | Sherlock periphery update review (Sep 2026), fixes                                                   | `4cbfd5aa5866fd1e570ce4f7726ba65c4a6051f5` | [`d4d0e2a`](https://github.com/Metricxyz/pool-contracts/tree/audit-d4d0e2a) | [VERIFY.md](https://github.com/Metricxyz/periphery-contracts/blob/audit-ed58520/VERIFY.md) |
+
+In these tags the `lib/metric-core` submodule points at the private repository where the code was developed, so `git submodule update` can't fetch it. The same metric-core code is published in [pool-contracts](https://github.com/Metricxyz/pool-contracts) under the tag in the `lib/metric-core` column.
+
+To verify a tag, clone it and run its check script (Python 3 and git only):
+
+```bash
+git clone --branch audit-ed58520 https://github.com/Metricxyz/periphery-contracts.git
+cd periphery-contracts
+python verify/verify.py .
+```
+
+It ends with `OK: contracts/ at this tag is identical to contracts/ in audited commit …`. Each tag's `VERIFY.md` explains the check step by step. For a quick look, compare the hash directly:
+
+```bash
+git rev-parse audit-ed58520:contracts   # 4cbfd5aa5866fd1e570ce4f7726ba65c4a6051f5
+```
+
+### Changes since the last audit
+
+Since `ed58520` there is one logic change: `02096b5` makes the quoter's live quotes revert with `PoolPaused` for paused pools. Unused code was also removed (an internal helper and the unused `InvalidPriceLimitForDirection` error), and the quoter's return values are now named. Every other change is to NatSpec, documentation or formatting.
 
 ## License
 
