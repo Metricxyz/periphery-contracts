@@ -22,10 +22,12 @@ import {MetricOmmSwapQuoteDecode} from "./MetricOmmSwapQuoteDecode.sol";
 ///      cumulative amount through `simulateSwapAndRevert` - never re-derived swap math for the traded amounts.
 ///      Simulations use the data provider as both sender and recipient, with empty extension data; depth is
 ///      therefore evaluated in the provider's extension context, not a particular trader's or router's.
-///      If a bin's full-crossing amount reverts for a reason other than the expected `SimulateSwap` payload (e.g. an
-///      extension gate), the ladder binary-searches (bisecting from the bin's midpoint, up to `MAX_BINARY_SEARCH_ITERATIONS`
-///      probes) the maximal amount that still succeeds within that bin, then stops - since any larger amount is
-///      assumed to keep failing the same way.
+///      A side stops at the first bin whose full-crossing cumulative amount does not fill in full (e.g. an extension
+///      gate reverts it). That bin is found by simulating the first funded bin, then the whole side, then
+///      binary-searching the rest (see `_resolveSide`), rather than simulating every bin's cumulative amount in turn.
+///      This relies on refusals being monotone in trade size. Only the rows kept are priced. In the stop bin the
+///      ladder bisects (from the bin's midpoint, up to `MAX_BINARY_SEARCH_ITERATIONS` probes) the maximal amount that
+///      still succeeds - any larger amount is assumed to keep failing the same way.
 library LiquidityLadder {
   using SafeCast for uint256;
   using SafeCast for int256;
@@ -51,7 +53,9 @@ library LiquidityLadder {
   /// @param amountAvailableInBin Raw amount tradeable in this bin per pool state, ignoring extensions (partial for the current bin).
   /// @param amountTradeableInBin Amount actually reachable in this bin once extension gates are accounted for; `< amountAvailableInBin` only on the row where the ladder stops.
   /// @param cumulativeOut Cumulative amount received by the trader through this bin (token0 for asks, token1 for bids).
-  /// @param cumulativeIn Cumulative amount paid by the trader through this bin (token1 for asks, token0 for bids).
+  /// @param cumulativeIn Cumulative amount paid by the trader through this bin (token1 for asks, token0 for bids), or
+  ///        zero when the cumulative trade through this bin was not simulated on its own (a row before the last one a
+  ///        side simulated; see `_resolveSide`). A non-zero `cumulativeOut` with a zero `cumulativeIn` marks such a row.
   struct DepthLevel {
     int16 binIdx;
     uint256 lowerEffPriceX64;
@@ -79,14 +83,6 @@ library LiquidityLadder {
     uint128 effectiveCurrentAskX64;
     DepthLevel[] asks;
     DepthLevel[] bids;
-  }
-
-  /// @dev Running ladder state, passed by reference so the build loops carry one pointer instead of three
-  ///      separate stack slots (keeps the via-IR build's stack shallow).
-  struct LadderAccumulator {
-    uint256 cumOut;
-    uint256 cumIn;
-    uint256 filled;
   }
 
   /// @dev Bundles the per-side simulate-call parameters so ladder building and binary search pass one
@@ -234,66 +230,33 @@ library LiquidityLadder {
     return amountScaled / scaleMultiplier;
   }
 
-  /// @dev Fee-adjusted bounds and raw tradeable amount for one ask-side bin. Splitting this out of
-  ///      `_buildAskLadder` keeps that loop's stack shallow enough for the via-IR build.
-  function _askBinBounds(
-    address pool,
-    DepthEnv memory env,
-    int16 binIdx,
+  /// @dev Fee-adjusted execution prices at a bin's two bounds, from its lower-bound distance and length. Mirrors the
+  ///      pool's own per-bin bounds in `MetricOmmPool._swapAcrossBins`; `isSell` selects the bid-side adjustment.
+  function _binEffBounds(
     uint256 referencePriceX64,
+    int256 lowerDistE6,
+    uint16 lengthE6,
+    uint256 baseFeeX64,
+    uint16 addFeeE6,
     uint256 notionalFeeX64,
-    int256 lowerDistE6
-  )
-    internal
-    view
-    returns (uint256 lowerEffPriceX64, uint256 upperEffPriceX64, uint256 amountAvailableInBin, uint256 lengthE6)
-  {
-    uint16 addFeeBuyE6;
-    uint104 t0;
-    (t0,, lengthE6, addFeeBuyE6,) = PoolStateLibrary._binState(pool, binIdx);
-
+    bool isSell
+  ) internal pure returns (uint256 lowerEffPriceX64, uint256 upperEffPriceX64) {
     uint256 lowerReferencePriceX64 = _priceFromReferenceAndDistE6(referencePriceX64, lowerDistE6, Math.Rounding.Floor);
     // forge-lint: disable-next-line(unsafe-typecast)
     int256 upperDistE6 = lowerDistE6 + int256(uint256(lengthE6));
     uint256 upperReferencePriceX64 = _priceFromReferenceAndDistE6(referencePriceX64, upperDistE6, Math.Rounding.Floor);
-    uint256 buyFeeX64 = FeeMath.binTotalFeeX64(env.baseBuyFeeX64, addFeeBuyE6, notionalFeeX64);
-    lowerEffPriceX64 = FeeMath.effectivePriceX64(lowerReferencePriceX64, buyFeeX64, false);
-    upperEffPriceX64 = FeeMath.effectivePriceX64(upperReferencePriceX64, buyFeeX64, false);
-
-    amountAvailableInBin = _toExternal(uint256(t0), env.token0ScaleMultiplier);
-  }
-
-  /// @dev Fee-adjusted bounds and raw tradeable amount for one bid-side bin. `lowerDistE6` must already be this
-  ///      bin's own lower-bound distance (the caller walks it down bin-by-bin); see `_buildBidLadder`.
-  function _bidBinBounds(
-    address pool,
-    DepthEnv memory env,
-    int16 binIdx,
-    uint256 referencePriceX64,
-    uint256 notionalFeeX64,
-    int256 lowerDistE6
-  ) internal view returns (uint256 lowerEffPriceX64, uint256 upperEffPriceX64, uint256 amountAvailableInBin) {
-    (, uint104 t1, uint16 lengthE6,, uint16 addFeeSellE6) = PoolStateLibrary._binState(pool, binIdx);
-
-    uint256 lowerReferencePriceX64 = _priceFromReferenceAndDistE6(referencePriceX64, lowerDistE6, Math.Rounding.Floor);
-    // forge-lint: disable-next-line(unsafe-typecast)
-    int256 upperDistE6 = lowerDistE6 + int256(uint256(lengthE6));
-    uint256 upperReferencePriceX64 = _priceFromReferenceAndDistE6(referencePriceX64, upperDistE6, Math.Rounding.Floor);
-    uint256 sellFeeX64 = FeeMath.binTotalFeeX64(env.baseSellFeeX64, addFeeSellE6, notionalFeeX64);
-    lowerEffPriceX64 = FeeMath.effectivePriceX64(lowerReferencePriceX64, sellFeeX64, true);
-    upperEffPriceX64 = FeeMath.effectivePriceX64(upperReferencePriceX64, sellFeeX64, true);
-
-    amountAvailableInBin = _toExternal(uint256(t1), env.token1ScaleMultiplier);
-  }
-
-  /// @dev A bin's own length, in E6. The caller derives a lower bin's lower-bound distance from the bin above's
-  ///      (contiguous) lower-bound distance minus the LOWER bin's own length - see `_buildBidLadder`.
-  function _binLengthE6(address pool, int16 binIdx) internal view returns (uint16 lengthE6) {
-    (,, lengthE6,,) = PoolStateLibrary._binState(pool, binIdx);
+    uint256 feeX64 = FeeMath.binTotalFeeX64(baseFeeX64, addFeeE6, notionalFeeX64);
+    lowerEffPriceX64 = FeeMath.effectivePriceX64(lowerReferencePriceX64, feeX64, isSell);
+    upperEffPriceX64 = FeeMath.effectivePriceX64(upperReferencePriceX64, feeX64, isSell);
   }
 
   // ============ Internal: depth ladder walks ============
-  // A bin with zero raw balance still gets a row (flat cumulatives) and the walk continues past it.
+  // Each side is built in two steps:
+  //   1. Decide how far the side actually executes with as few bin reads and `simulateSwapAndRevert` calls as it
+  //      can (`_resolveSide`), and truncate the side there. A bin with zero raw balance still gets a row.
+  //   2. Price only the rows that are kept. A row past the stop is never priced, so a bin whose bounds cannot be
+  //      computed (e.g. a cumulative distance below -1e6) cannot revert a ladder that stops before it, exactly as the
+  //      bin-by-bin walk never reached it.
 
   function _buildAskLadder(
     address pool,
@@ -310,6 +273,8 @@ library LiquidityLadder {
     asks = new DepthLevel[](maxRows);
     if (maxRows == 0) return asks;
 
+    bytes32[] memory states = new bytes32[](maxRows);
+
     SwapPriceContext memory ctx = SwapPriceContext({
       zeroForOne: false,
       priceLimitX64: MetricOmmSwapPath.openLimit(false),
@@ -317,49 +282,8 @@ library LiquidityLadder {
       askPriceX64: askPriceX64,
       referencePriceX64: referencePriceX64
     });
-
-    uint256 notionalFeeX64 = FeeMath._notionalFeeX64(uint24(env.notionalFeeE8));
-    int256 cumDistE6 = int256(env.curBinDistFromProvidedPriceE6);
-    LadderAccumulator memory acc;
-
-    for (int256 b = int256(env.curBinIdx); b <= int256(highCap); b++) {
-      // forge-lint: disable-next-line(unsafe-typecast)
-      int16 binIdx = int16(b);
-      bool shouldStop;
-      (cumDistE6, shouldStop) = _processAskBin(pool, env, ctx, notionalFeeX64, binIdx, cumDistE6, asks, acc);
-      if (shouldStop) break;
-    }
-
-    _truncate(asks, acc.filled);
-  }
-
-  /// @dev One ask-side bin: bounds + sizing + simulate + row recording. Split out of `_buildAskLadder`'s loop to
-  ///      keep that loop's stack shallow for the via-IR build.
-  function _processAskBin(
-    address pool,
-    DepthEnv memory env,
-    SwapPriceContext memory ctx,
-    uint256 notionalFeeX64,
-    int16 binIdx,
-    int256 cumDistE6,
-    DepthLevel[] memory asks,
-    LadderAccumulator memory acc
-  ) internal returns (int256 nextCumDistE6, bool shouldStop) {
-    (uint256 lowerEffPriceX64, uint256 upperEffPriceX64, uint256 amountAvailableInBin, uint256 lengthE6) =
-      _askBinBounds(pool, env, binIdx, uint256(ctx.referencePriceX64), notionalFeeX64, cumDistE6);
-    // forge-lint: disable-next-line(unsafe-typecast)
-    nextCumDistE6 = cumDistE6 + int256(lengthE6);
-
-    uint256 outAmt;
-    uint256 inAmt;
-    bool madeProgress;
-    if (amountAvailableInBin > 0) {
-      (outAmt, inAmt, madeProgress) = _maxSucceedingAmount(pool, ctx, acc.cumOut, amountAvailableInBin);
-    }
-    bool reachedFullBin = _recordLadderRow(
-      asks, acc, binIdx, lowerEffPriceX64, upperEffPriceX64, amountAvailableInBin, outAmt, inAmt, madeProgress
-    );
-    shouldStop = amountAvailableInBin > 0 && !reachedFullBin;
+    _truncate(asks, _resolveSide(pool, env, ctx, asks, states));
+    _priceAskRows(env, uint256(referencePriceX64), asks, states);
   }
 
   function _buildBidLadder(
@@ -377,6 +301,8 @@ library LiquidityLadder {
     bids = new DepthLevel[](maxRows);
     if (maxRows == 0) return bids;
 
+    bytes32[] memory states = new bytes32[](maxRows);
+
     SwapPriceContext memory ctx = SwapPriceContext({
       zeroForOne: true,
       priceLimitX64: MetricOmmSwapPath.openLimit(true),
@@ -384,117 +310,268 @@ library LiquidityLadder {
       askPriceX64: askPriceX64,
       referencePriceX64: referencePriceX64
     });
-
-    uint256 notionalFeeX64 = FeeMath._notionalFeeX64(uint24(env.notionalFeeE8));
-    int256 walkDistE6 = int256(env.curBinDistFromProvidedPriceE6);
-    LadderAccumulator memory acc;
-
-    for (int256 b = int256(env.curBinIdx); b >= int256(lowCap); b--) {
-      // forge-lint: disable-next-line(unsafe-typecast)
-      int16 binIdx = int16(b);
-      if (binIdx != env.curBinIdx) {
-        // forge-lint: disable-next-line(unsafe-typecast)
-        walkDistE6 -= int256(uint256(_binLengthE6(pool, binIdx)));
-      }
-
-      bool shouldStop;
-      (walkDistE6, shouldStop) = _processBidBin(pool, env, ctx, notionalFeeX64, binIdx, walkDistE6, bids, acc);
-      if (shouldStop) break;
-    }
-
-    _truncate(bids, acc.filled);
+    _truncate(bids, _resolveSide(pool, env, ctx, bids, states));
+    _priceBidRows(env, uint256(referencePriceX64), bids, states);
   }
 
-  /// @dev One bid-side bin: bounds + sizing + simulate + row recording. `walkDistE6` in must already be `binIdx`'s
-  ///      own lower-bound distance (the caller decrements it bin-by-bin before calling). Split out of
-  ///      `_buildBidLadder`'s loop to keep that loop's stack shallow for the via-IR build.
-  function _processBidBin(
+  /// @dev Reads rows `[from, to)`: sets each row's `binIdx` (from the current bin, upward for asks and downward for
+  ///      bids), reads their bin states in one batched `extsload` into `states`, and records each row's raw balance on
+  ///      the side's output token. Rows never read keep a zero balance and a zero state.
+  function _readRows(
+    address pool,
+    DepthEnv memory env,
+    bool isBid,
+    DepthLevel[] memory rows,
+    bytes32[] memory states,
+    uint256 from,
+    uint256 to
+  ) internal view {
+    if (from >= to) return;
+    int16[] memory binIdxs = new int16[](to - from);
+    for (uint256 i = from; i < to; i++) {
+      // forge-lint: disable-next-line(unsafe-typecast)
+      int16 binIdx = isBid ? int16(int256(env.curBinIdx) - int256(i)) : int16(int256(env.curBinIdx) + int256(i));
+      binIdxs[i - from] = binIdx;
+      rows[i].binIdx = binIdx;
+    }
+    bytes32[] memory read = PoolStateLibrary._multipleBinStates(pool, binIdxs);
+    for (uint256 i = from; i < to; i++) {
+      states[i] = read[i - from];
+      (uint104 t0, uint104 t1,,,) = PoolStateLibrary._decodeBinState(states[i]);
+      rows[i].amountAvailableInBin = isBid
+        ? _toExternal(uint256(t1), env.token1ScaleMultiplier)
+        : _toExternal(uint256(t0), env.token0ScaleMultiplier);
+    }
+  }
+
+  /// @dev Prices the kept ask rows. A row's lower-bound distance is the current bin's plus the lengths of every row
+  ///      before it.
+  function _priceAskRows(
+    DepthEnv memory env,
+    uint256 referencePriceX64,
+    DepthLevel[] memory rows,
+    bytes32[] memory states
+  ) internal pure {
+    uint256 notionalFeeX64 = FeeMath._notionalFeeX64(uint24(env.notionalFeeE8));
+    int256 lowerDistE6 = int256(env.curBinDistFromProvidedPriceE6);
+    for (uint256 i; i < rows.length; i++) {
+      (,, uint16 lengthE6, uint16 addFeeBuyE6,) = PoolStateLibrary._decodeBinState(states[i]);
+      (rows[i].lowerEffPriceX64, rows[i].upperEffPriceX64) =
+        _binEffBounds(referencePriceX64, lowerDistE6, lengthE6, env.baseBuyFeeX64, addFeeBuyE6, notionalFeeX64, false);
+      // forge-lint: disable-next-line(unsafe-typecast)
+      lowerDistE6 += int256(uint256(lengthE6));
+    }
+  }
+
+  /// @dev Prices the kept bid rows. The current bin's lower-bound distance is `curBinDistFromProvidedPriceE6`; each
+  ///      lower bin's is the bin above's minus the lower bin's own length (bins are contiguous).
+  function _priceBidRows(
+    DepthEnv memory env,
+    uint256 referencePriceX64,
+    DepthLevel[] memory rows,
+    bytes32[] memory states
+  ) internal pure {
+    uint256 notionalFeeX64 = FeeMath._notionalFeeX64(uint24(env.notionalFeeE8));
+    int256 lowerDistE6 = int256(env.curBinDistFromProvidedPriceE6);
+    for (uint256 i; i < rows.length; i++) {
+      (,, uint16 lengthE6,, uint16 addFeeSellE6) = PoolStateLibrary._decodeBinState(states[i]);
+      // forge-lint: disable-next-line(unsafe-typecast)
+      if (i != 0) lowerDistE6 -= int256(uint256(lengthE6));
+      (rows[i].lowerEffPriceX64, rows[i].upperEffPriceX64) =
+        _binEffBounds(referencePriceX64, lowerDistE6, lengthE6, env.baseSellFeeX64, addFeeSellE6, notionalFeeX64, true);
+    }
+  }
+
+  // ============ Internal: how far a side executes ============
+
+  /// @dev One `simulateSwapAndRevert` outcome: `ok` when it answered with the `SimulateSwap` payload.
+  struct SimResult {
+    bool ok;
+    uint256 outAmt;
+    uint256 inAmt;
+  }
+
+  /// @dev A side's funded rows (`amountAvailableInBin > 0`), in walk order. `prefixOut[k]` is the cumulative output
+  ///      that crosses funded rows `0..k` in full, and `prefixIn[k]` the input a simulation of exactly that amount
+  ///      charged, or zero if that prefix was never simulated on its own.
+  struct FundedRows {
+    uint256[] rowIdx;
+    uint256[] prefixOut;
+    uint256[] prefixIn;
+    uint256 count;
+  }
+
+  /// @dev Reads the side's bins as it needs them (into `rows` and `states`), fills in the simulate-backed fields, and
+  ///      returns how many rows to keep. Rows past the returned length may be unread.
+  ///
+  ///      A side stops at the first bin that cannot be filled in full - the row the former bin-by-bin walk stopped at,
+  ///      provided refusals are monotone in trade size (below) - but that row is found without simulating every
+  ///      prefix of the side:
+  ///
+  ///      1. Read bins one at a time up to the first funded one and simulate it on its own. A tripped stop-loss
+  ///         usually refuses right there, and then the side is settled having read and simulated nothing past that
+  ///         bin, exactly as the bin-by-bin walk.
+  ///      2. Otherwise read every remaining bin up to the cap (one batched `extsload`) and simulate the trade that
+  ///         crosses every funded row. If it fills in full, so does every smaller trade: nothing on the side is
+  ///         refused.
+  ///      3. Otherwise binary-search the funded rows after the first for the first whose cumulative trade does not
+  ///         fill in full.
+  ///      4. In that row, keep the simulation's own partial fill if it answered, else bisect for the largest amount
+  ///         that still succeeds (`_bisect`, unchanged from the bin-by-bin walk).
+  ///
+  ///      Steps 2 and 3 rely on refusals being monotone in trade size: if a cumulative amount fails, every larger one
+  ///      fails too. The bin-by-bin walk already assumed this past its stop row (it never looked further); this
+  ///      extends the assumption to the rows before it. An extension that refuses a mid-sized trade while accepting
+  ///      a larger one would be reported as accepting everything up to the largest it accepts.
+  ///
+  ///      A row whose cumulative trade was not simulated on its own keeps `cumulativeIn == 0` while its
+  ///      `cumulativeOut` is positive; its `cumulativeOut` is still exact, since a full fill delivers exactly the
+  ///      requested output. Cost on an unrefused side with `n > 1` funded rows: 2 simulations instead of `n`; on a
+  ///      side refused at funded row `s`: 1 simulation when `s == 0`, else 2 + ceil(log2(n - 1)), plus the stop row's
+  ///      bisection, instead of `s + 1` plus the same bisection.
+  function _resolveSide(
     address pool,
     DepthEnv memory env,
     SwapPriceContext memory ctx,
-    uint256 notionalFeeX64,
-    int16 binIdx,
-    int256 walkDistE6,
-    DepthLevel[] memory bids,
-    LadderAccumulator memory acc
-  ) internal returns (int256 nextWalkDistE6, bool shouldStop) {
-    nextWalkDistE6 = walkDistE6;
-    (uint256 lowerEffPriceX64, uint256 upperEffPriceX64, uint256 amountAvailableInBin) =
-      _bidBinBounds(pool, env, binIdx, uint256(ctx.referencePriceX64), notionalFeeX64, walkDistE6);
-
-    uint256 outAmt;
-    uint256 inAmt;
-    bool madeProgress;
-    if (amountAvailableInBin > 0) {
-      (outAmt, inAmt, madeProgress) = _maxSucceedingAmount(pool, ctx, acc.cumOut, amountAvailableInBin);
+    DepthLevel[] memory rows,
+    bytes32[] memory states
+  ) internal returns (uint256 length) {
+    uint256 n = rows.length;
+    bool isBid = ctx.zeroForOne;
+    uint256 first;
+    for (; first < n; first++) {
+      _readRows(pool, env, isBid, rows, states, first, first + 1);
+      if (rows[first].amountAvailableInBin > 0) break;
     }
-    bool reachedFullBin = _recordLadderRow(
-      bids, acc, binIdx, lowerEffPriceX64, upperEffPriceX64, amountAvailableInBin, outAmt, inAmt, madeProgress
-    );
-    shouldStop = amountAvailableInBin > 0 && !reachedFullBin;
+    // Nothing funded: every row stays flat at zero, exactly as the walk recorded them.
+    if (first == n) return n;
+
+    uint256 firstOut = rows[first].amountAvailableInBin;
+    SimResult memory firstResult = _trySimulateExactOutput(pool, ctx, firstOut);
+    if (!_filledInFull(firstResult, firstOut)) {
+      // Only rows [0, first] are read, so the funded rows are just `first`.
+      _recordStopRow(pool, ctx, rows[first], _fundedRows(rows), 0, firstResult);
+      return first + 1;
+    }
+
+    _readRows(pool, env, isBid, rows, states, first + 1, n);
+    FundedRows memory funded = _fundedRows(rows);
+    funded.prefixIn[0] = firstResult.inAmt;
+    uint256 last = funded.count - 1;
+    if (last == 0) {
+      _recordFullRows(rows, funded, n);
+      return n;
+    }
+
+    SimResult memory stopResult = _trySimulateExactOutput(pool, ctx, funded.prefixOut[last]);
+    if (_filledInFull(stopResult, funded.prefixOut[last])) {
+      funded.prefixIn[last] = stopResult.inAmt;
+      _recordFullRows(rows, funded, n);
+      return n;
+    }
+
+    // Invariant: funded rows [0, good) fill in full, and `good - 1` was simulated on its own; funded row `stop` does
+    // not fill in full, and `stopResult` is its result. Binary-search [good, stop): every row it advances `good` past
+    // is one it simulated.
+    uint256 good = 1;
+    uint256 stop = last;
+    while (stop > good) {
+      uint256 mid = good + (stop - good) / 2;
+      SimResult memory midResult = _trySimulateExactOutput(pool, ctx, funded.prefixOut[mid]);
+      if (_filledInFull(midResult, funded.prefixOut[mid])) {
+        funded.prefixIn[mid] = midResult.inAmt;
+        good = mid + 1;
+      } else {
+        stop = mid;
+        stopResult = midResult;
+      }
+    }
+
+    uint256 stopRow = funded.rowIdx[stop];
+    _recordFullRows(rows, funded, stopRow);
+    _recordStopRow(pool, ctx, rows[stopRow], funded, stop, stopResult);
+    length = stopRow + 1;
   }
 
-  /// @dev Appends one row using `acc.cumOut`/`acc.cumIn` as the prior cumulative and advances `acc` in place.
-  ///      Returns whether this bin's full `amountAvailableInBin` was reached (false for a zero-amount bin too,
-  ///      but the caller only treats that as a stop when `amountAvailableInBin > 0`).
-  function _recordLadderRow(
-    DepthLevel[] memory levels,
-    LadderAccumulator memory acc,
-    int16 binIdx,
-    uint256 lowerEffPriceX64,
-    uint256 upperEffPriceX64,
-    uint256 amountAvailableInBin,
-    uint256 outAmt,
-    uint256 inAmt,
-    bool madeProgress
-  ) internal pure returns (bool reachedFullBin) {
-    uint256 priorCumOut = acc.cumOut;
-    reachedFullBin = madeProgress && (outAmt - priorCumOut) == amountAvailableInBin;
-
-    levels[acc.filled] = DepthLevel({
-      binIdx: binIdx,
-      lowerEffPriceX64: lowerEffPriceX64,
-      upperEffPriceX64: upperEffPriceX64,
-      amountAvailableInBin: amountAvailableInBin,
-      amountTradeableInBin: madeProgress ? outAmt - priorCumOut : 0,
-      cumulativeOut: madeProgress ? outAmt : priorCumOut,
-      cumulativeIn: madeProgress ? inAmt : acc.cumIn
-    });
-    acc.filled++;
-    if (madeProgress) {
-      acc.cumOut = outAmt;
-      acc.cumIn = inAmt;
+  /// @dev Collects a side's funded rows and their cumulative full-fill outputs. Cannot overflow: each bin's raw
+  ///      balance is a `uint104` and a side holds at most 256 bins.
+  function _fundedRows(DepthLevel[] memory rows) internal pure returns (FundedRows memory funded) {
+    uint256 n = rows.length;
+    funded.rowIdx = new uint256[](n);
+    funded.prefixOut = new uint256[](n);
+    funded.prefixIn = new uint256[](n);
+    uint256 cumOut;
+    for (uint256 i; i < n; i++) {
+      uint256 available = rows[i].amountAvailableInBin;
+      if (available == 0) continue;
+      cumOut += available;
+      funded.rowIdx[funded.count] = i;
+      funded.prefixOut[funded.count] = cumOut;
+      funded.count++;
     }
   }
 
-  // ============ Internal: simulate-backed sizing with binary-search fallback ============
+  /// @dev Whether a simulation of `amount` filled it in full - the bin-by-bin walk's `reachedFullBin`, over the
+  ///      whole cumulative amount instead of one bin's share of it.
+  function _filledInFull(SimResult memory result, uint256 amount) internal pure returns (bool) {
+    return result.ok && result.outAmt == amount;
+  }
 
-  /// @dev Tries the full-bin candidate first. If it fails to decode as `SimulateSwap` (e.g. an extension gate),
-  ///      binary-searches `[lastGoodCumAmt, lastGoodCumAmt + binExternalAmount]` starting at its midpoint, for up
-  ///      to `MAX_BINARY_SEARCH_ITERATIONS` probes, keeping the largest amount found to still succeed. Returns
-  ///      `madeProgress = false` if none of the probes ever succeed (nothing tradable in this bin).
-  function _maxSucceedingAmount(
+  /// @dev Records rows `[0, end)` as filled in full: every funded row's whole balance is tradeable, and a zero-balance
+  ///      row carries the cumulative amounts of the row before it (flat), as in the bin-by-bin walk.
+  function _recordFullRows(DepthLevel[] memory rows, FundedRows memory funded, uint256 end) internal pure {
+    uint256 k;
+    uint256 cumOut;
+    uint256 cumIn;
+    for (uint256 i; i < end; i++) {
+      if (rows[i].amountAvailableInBin > 0) {
+        rows[i].amountTradeableInBin = rows[i].amountAvailableInBin;
+        cumOut = funded.prefixOut[k];
+        cumIn = funded.prefixIn[k];
+        k++;
+      }
+      rows[i].cumulativeOut = cumOut;
+      rows[i].cumulativeIn = cumIn;
+    }
+  }
+
+  /// @dev Records the row a side stops at: how much of it still executes, and the cumulative amounts through that.
+  ///      `stop` indexes the funded rows; every funded row before it filled in full, and the one just before it was
+  ///      simulated on its own (the search only advances past a row it simulated), so its `prefixIn` is known.
+  function _recordStopRow(
     address pool,
     SwapPriceContext memory ctx,
-    uint256 lastGoodCumAmt,
-    uint256 binExternalAmount
-  ) internal returns (uint256 outAmt, uint256 inAmt, bool madeProgress) {
-    uint256 candidate = lastGoodCumAmt + binExternalAmount;
-    (bool candidateOk, uint256 cOut, uint256 cIn) = _trySimulateExactOutput(pool, ctx, candidate);
-    if (candidateOk) return (cOut, cIn, true);
+    DepthLevel memory row,
+    FundedRows memory funded,
+    uint256 stop,
+    SimResult memory stopResult
+  ) internal {
+    uint256 priorOut = stop == 0 ? 0 : funded.prefixOut[stop - 1];
+    uint256 priorIn = stop == 0 ? 0 : funded.prefixIn[stop - 1];
+    // A simulation that answered but delivered short of the full amount is the row's fill as it stands, exactly as
+    // the walk took it from its full-bin candidate; only a refused one needs the bisection.
+    SimResult memory fill = stopResult.ok ? stopResult : _bisect(pool, ctx, priorOut, funded.prefixOut[stop]);
+    row.amountTradeableInBin = fill.ok ? fill.outAmt - priorOut : 0;
+    row.cumulativeOut = fill.ok ? fill.outAmt : priorOut;
+    row.cumulativeIn = fill.ok ? fill.inAmt : priorIn;
+  }
 
-    uint256 lo = lastGoodCumAmt;
-    uint256 hi = candidate;
+  // ============ Internal: simulate-backed sizing ============
 
+  /// @dev Bisects `(lo, hi)` - `lo` known to fill (or zero), `hi` known to be refused - starting at its midpoint, for
+  ///      up to `MAX_BINARY_SEARCH_ITERATIONS` probes, keeping the largest amount found to still succeed. `ok` is
+  ///      false if none of the probes ever succeed (nothing tradable past `lo`).
+  function _bisect(address pool, SwapPriceContext memory ctx, uint256 lo, uint256 hi)
+    internal
+    returns (SimResult memory best)
+  {
     for (uint256 i; i < MAX_BINARY_SEARCH_ITERATIONS; ++i) {
       if (hi - lo <= 1) break;
       uint256 mid = lo + (hi - lo) / 2;
-      (bool midOk, uint256 mOut, uint256 mIn) = _trySimulateExactOutput(pool, ctx, mid);
-      if (midOk) {
+      SimResult memory midResult = _trySimulateExactOutput(pool, ctx, mid);
+      if (midResult.ok) {
         lo = mid;
-        outAmt = mOut;
-        inAmt = mIn;
-        madeProgress = true;
+        best = midResult;
       } else {
         hi = mid;
       }
@@ -505,7 +582,7 @@ library LiquidityLadder {
   ///      receives and pays, regardless of which token0/token1 leg that maps to for `ctx.zeroForOne`.
   function _trySimulateExactOutput(address pool, SwapPriceContext memory ctx, uint256 amountOutExternal)
     internal
-    returns (bool ok, uint256 outAmt, uint256 inAmt)
+    returns (SimResult memory result)
   {
     int128 amountSpecified = MetricOmmSwapInputs.asAmountSpecifiedOut(MetricOmmSwapInputs.toUint128(amountOutExternal));
     try IMetricOmmPoolActions(pool)
@@ -526,14 +603,14 @@ library LiquidityLadder {
     } catch (bytes memory reason) {
       (int128 amount0Delta, int128 amount1Delta, bool matched) =
         MetricOmmSwapQuoteDecode.decodeSwapDeltas(reason, IMetricOmmPoolActions.SimulateSwap.selector);
-      if (!matched) return (false, 0, 0);
-      ok = true;
+      if (!matched) return result;
+      result.ok = true;
       if (ctx.zeroForOne) {
-        outAmt = (-int256(amount1Delta)).toUint256();
-        inAmt = int256(amount0Delta).toUint256();
+        result.outAmt = (-int256(amount1Delta)).toUint256();
+        result.inAmt = int256(amount0Delta).toUint256();
       } else {
-        outAmt = (-int256(amount0Delta)).toUint256();
-        inAmt = int256(amount1Delta).toUint256();
+        result.outAmt = (-int256(amount0Delta)).toUint256();
+        result.inAmt = int256(amount1Delta).toUint256();
       }
     }
   }
