@@ -69,7 +69,7 @@ contract MetricOmmPoolLiquidityAdder is IMetricOmmPoolLiquidityAdder, PeripheryP
     uint256 maxAmountToken1,
     BinPositionBounds calldata binPositionBounds,
     bytes calldata extensionData
-  ) external payable override returns (uint256 amount0Added, uint256 amount1Added) {
+  ) external payable override nonReentrant returns (uint256 amount0Added, uint256 amount1Added) {
     _requireFactoryPool(pool);
     _validateOwner(owner);
     _validateDeltas(deltas);
@@ -86,7 +86,7 @@ contract MetricOmmPoolLiquidityAdder is IMetricOmmPoolLiquidityAdder, PeripheryP
     uint256 maxAmountToken1,
     BinPositionBounds calldata binPositionBounds,
     bytes calldata extensionData
-  ) external payable override returns (uint256 amount0Added, uint256 amount1Added) {
+  ) external payable override nonReentrant returns (uint256 amount0Added, uint256 amount1Added) {
     _requireFactoryPool(pool);
     _validateDeltas(deltas);
     _validateBinAndBinPosition(pool, binPositionBounds);
@@ -110,7 +110,7 @@ contract MetricOmmPoolLiquidityAdder is IMetricOmmPoolLiquidityAdder, PeripheryP
     uint256 maxAmountToken1,
     BinPositionBounds calldata binPositionBounds,
     bytes calldata extensionData
-  ) external payable override returns (uint256 amount0Added, uint256 amount1Added) {
+  ) external payable override nonReentrant returns (uint256 amount0Added, uint256 amount1Added) {
     _requireFactoryPool(pool);
     _validateOwner(owner);
     _validateDeltas(weightDeltas);
@@ -145,7 +145,7 @@ contract MetricOmmPoolLiquidityAdder is IMetricOmmPoolLiquidityAdder, PeripheryP
     uint256 maxAmountToken1,
     BinPositionBounds calldata binPositionBounds,
     bytes calldata extensionData
-  ) external payable override returns (uint256 amount0Added, uint256 amount1Added) {
+  ) external payable override nonReentrant returns (uint256 amount0Added, uint256 amount1Added) {
     _requireFactoryPool(pool);
     _validateDeltas(weightDeltas);
     _validatePositiveWeights(weightDeltas);
